@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Zombie Face AR</title>
+<style>
+:root{--bg:#0b110b;--fg:#eaf5df;--accent:#9be34a;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#0b110b;--fg:#eaf5df}}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,sans-serif;overflow:hidden}
+canvas{position:absolute;inset:0;width:100%;height:100%}
+#ui{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;text-align:center;padding:24px;background:rgba(8,12,8,.88)}
+#ui h1{margin:0;font-size:26px}
+#ui p{margin:0;max-width:320px;opacity:.85;font-size:15px;line-height:1.4}
+button{background:var(--accent);color:#0f1a05;border:0;border-radius:999px;padding:14px 26px;font-size:16px;font-weight:700}
+#hud{position:absolute;left:0;right:0;bottom:calc(14px + env(safe-area-inset-bottom,0px));text-align:center;font-size:13px;opacity:.9;pointer-events:none;text-shadow:0 1px 4px #000}
+#tag{position:absolute;top:calc(8px + env(safe-area-inset-top,0px));left:10px;font-size:12px;background:#0008;color:#fff;padding:4px 8px;border-radius:8px;display:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="tag"></div>
+<div id="hud"></div>
+<div id="ui">
+  <h1>🧟 Zombie Face</h1>
+  <p>Your face rots into a zombie, and worms crawl in and out of the holes in your skin. Use the front camera, good light, and keep your face in view.</p>
+  <button id="go">Start camera</button>
+</div>
+<video id="v" playsinline muted style="display:none"></video>
+
+<script>
+const cv=document.getElementById('c'),ctx=cv.getContext('2d'),vid=document.getElementById('v');
+const ui=document.getElementById('ui'),hud=document.getElementById('hud'),tagEl=document.getElementById('tag');
+let W=0,H=0,dpr=Math.min(devicePixelRatio||1,2);
+function resize(){W=innerWidth;H=innerHeight;cv.width=W*dpr;cv.height=H*dpr;ctx.setTransform(dpr,0,0,dpr,0,0)}
+addEventListener('resize',resize);resize();
+
+const OVAL=[10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400,377,152,148,176,149,150,136,172,58,132,93,234,127,162,21,54,103,67,109];
+const LIPS=[61,146,91,181,84,17,314,405,321,375,291,409,270,269,267,0,37,39,40,185];
+const LEYE=[33,246,161,160,159,158,157,173,133,155,154,153,145,144,163,7];
+const REYE=[362,398,384,385,386,387,388,466,263,249,390,373,374,380,381,382];
+
+let L=null,faceOk=false,lastSeen=0,fit=null,t0=performance.now(),wasOk=false;
+let seed=11;const rnd=()=>(seed=(seed*16807)%2147483647)/2147483647;
+
+// holes: landmark, radius (× face width)
+const HOLES=[{lm:205,r:.055},{lm:425,r:.05},{lm:151,r:.06},{lm:21,r:.042},{lm:251,r:.042},{lm:199,r:.05},{lm:172,r:.042}].map(h=>({...h,v:Array.from({length:12},()=>0.75+rnd()*0.5)}));
+const WCOL=['#e8b4a0','#d49a88','#cfd9ac','#b8725f','#eac9b8'];
+const NW=14,worms=[];
+[0,0,1,1,2,3,4,5,6].forEach((hi,k)=>worms.push({h:hi,phase:rnd()*6.28,speed:0.7+rnd()*0.7,col:WCOL[k%WCOL.length],th:0.045+rnd()*0.015,p:null}));
+
+const BLOTCH=[[205,.05,.02,.12,'#4d5a2a'],[425,-.04,.03,.12,'#5a3b2a'],[50,0,0,.1,'#2f3d3a'],[280,0,0,.1,'#4d5a2a'],[152,0,-.08,.12,'#5a3b2a'],[10,0,.05,.14,'#3a4a2a'],[234,.06,0,.12,'#2f3d3a'],[454,-.06,0,.12,'#3a4a2a'],[1,0,.05,.08,'#5a3b2a'],[70,0,.02,.09,'#2f3d3a'],[300,0,.02,.09,'#4d5a2a'],[117,0,0,.1,'#5a3b2a'],[346,0,0,.1,'#2f3d3a']];
+
+const poly=(ids)=>{ctx.beginPath();ids.forEach((i,k)=>{const p=L[i];k?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)});ctx.closePath()};
+const cen=ids=>{let x=0,y=0;ids.forEach(i=>{x+=L[i].x;y+=L[i].y});return{x:x/ids.length,y:y/ids.length}};
+const mix=(a,b,t)=>({x:a.x+(b.x-a.x)*t,y:a.y+(b.y-a.y)*t});
+
+function resetWorms(){for(const w of worms)w.p=null}
+
+function metrics(){
+  const fw=Math.max(40,Math.hypot(L[454].x-L[234].x,L[454].y-L[234].y));
+  return{fw,c:mix(L[10],L[152],.5),ang:Math.atan2(L[454].y-L[234].y,L[454].x-L[234].x)};
+}
+
+function scar(a,b,fw){
+  const dx=b.x-a.x,dy=b.y-a.y,len=Math.hypot(dx,dy)||1,nx=-dy/len,ny=dx/len,n=10;
+  const pts=[];for(let i=0;i<=n;i++){const t=i/n,j=(i%2?1:-1)*fw*0.006*(i>0&&i<n?1:0);pts.push({x:a.x+dx*t+nx*j,y:a.y+dy*t+ny*j})}
+  ctx.lineCap='round';ctx.lineJoin='round';
+  ctx.strokeStyle='rgba(150,60,60,.8)';ctx.lineWidth=fw*0.03;ctx.beginPath();pts.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));ctx.stroke();
+  ctx.strokeStyle='#3a0808';ctx.lineWidth=fw*0.014;ctx.beginPath();pts.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));ctx.stroke();
+  ctx.strokeStyle='#150c0c';ctx.lineWidth=fw*0.006;
+  const steps=Math.floor(len/(fw*0.04));
+  for(let i=1;i<steps;i++){const t=i/steps,x=a.x+dx*t,y=a.y+dy*t,s=fw*0.026;ctx.beginPath();ctx.moveTo(x+nx*s,y+ny*s);ctx.lineTo(x-nx*s,y-ny*s);ctx.stroke()}
+}
+
+function zombieSkin(m,time){
+  const {fw,c}=m;
+  ctx.save();poly(OVAL);ctx.clip();
+  ctx.globalCompositeOperation='saturation';ctx.fillStyle='rgba(128,128,128,.65)';ctx.fillRect(0,0,W,H);
+  ctx.globalCompositeOperation='multiply';
+  ctx.fillStyle='rgba(135,175,105,.75)';ctx.fillRect(0,0,W,H);
+  const vg=ctx.createRadialGradient(c.x,c.y,fw*0.1,c.x,c.y,fw*0.85);
+  vg.addColorStop(0,'#ffffff');vg.addColorStop(.65,'#d8d2c0');vg.addColorStop(1,'#625a48');
+  ctx.fillStyle=vg;ctx.fillRect(0,0,W,H);
+  for(const b of BLOTCH){
+    const p=L[b[0]],x=p.x+b[1]*fw,y=p.y+b[2]*fw,r=b[3]*fw;
+    const g=ctx.createRadialGradient(x,y,0,x,y,r);g.addColorStop(0,b[4]+'cc');g.addColorStop(1,b[4]+'00');
+    ctx.fillStyle=g;ctx.fillRect(x-r,y-r,r*2,r*2);
+  }
+  // sunken eye sockets
+  for(const ids of [LEYE,REYE]){
+    const e=cen(ids),r=fw*0.24,g=ctx.createRadialGradient(e.x,e.y,0,e.x,e.y,r);
+    g.addColorStop(0,'#ffffff');g.addColorStop(.35,'#ffffff');g.addColorStop(.62,'#4a2e4a');g.addColorStop(1,'#ffffff');
+    ctx.fillStyle=g;ctx.fillRect(e.x-r,e.y-r,r*2,r*2);
+  }
+  // dead lips
+  ctx.fillStyle='rgba(70,30,50,.75)';poly(LIPS);ctx.fill();
+  ctx.globalCompositeOperation='source-over';
+  // wounds
+  scar(L[117],L[61],fw);scar(L[425],L[291],fw);scar(L[336],L[251],fw);
+  ctx.restore();
+  // blood trickle from the mouth
+  const mc=L[291],len=fw*(0.16+0.04*Math.sin(time*0.002));
+  const bg=ctx.createLinearGradient(0,mc.y,0,mc.y+len);bg.addColorStop(0,'#7a0a0a');bg.addColorStop(1,'#3a0505');
+  ctx.strokeStyle=bg;ctx.lineCap='round';ctx.lineWidth=fw*0.022;ctx.beginPath();ctx.moveTo(mc.x,mc.y);ctx.lineTo(mc.x+fw*0.005,mc.y+len);ctx.stroke();
+  ctx.fillStyle='#6a0808';ctx.beginPath();ctx.arc(mc.x+fw*0.005,mc.y+len,fw*0.017,0,6.283);ctx.fill();
+}
+
+function zombieEyes(m){
+  const fw=m.fw;
+  for(const ids of [LEYE,REYE]){
+    const e=cen(ids);
+    ctx.save();poly(ids);ctx.clip();
+    ctx.fillStyle='rgba(224,232,205,.85)';ctx.fillRect(e.x-fw*.2,e.y-fw*.2,fw*.4,fw*.4);
+    ctx.strokeStyle='rgba(175,25,25,.65)';ctx.lineWidth=fw*0.004;
+    for(const i of ids){ctx.beginPath();ctx.moveTo(L[i].x,L[i].y);ctx.lineTo(L[i].x+(e.x-L[i].x)*0.55,L[i].y+(e.y-L[i].y)*0.55);ctx.stroke()}
+    ctx.fillStyle='rgba(120,135,100,.6)';ctx.beginPath();ctx.arc(e.x,e.y,fw*0.05,0,6.283);ctx.fill();
+    ctx.fillStyle='rgba(20,28,12,.9)';ctx.beginPath();ctx.arc(e.x,e.y,fw*0.022,0,6.283);ctx.fill();
+    ctx.restore();
+  }
+}
+
+function holePath(h,c,ang,fw,grow){
+  const n=h.v.length;
+  for(let i=0;i<n;i++){
+    const a=i/n*6.283+ang,r=h.r*fw*h.v[i]*(1+grow);
+    const x=c.x+Math.cos(a)*r,y=c.y+Math.sin(a)*r;
+    i?ctx.lineTo(x,y):ctx.moveTo(x,y);
+  }
+  ctx.closePath();
+}
+
+function stepWorm(w,c,o,fw,e,dt,time,idx){
+  const N=NW,seg=fw*(0.02+0.62*e)/(N-1),G=fw*8,P=w.p;
+  for(let j=1;j<N;j++){
+    const p=P[j],vx=(p.x-p.px)*0.97,vy=(p.y-p.py)*0.97;
+    p.px=p.x;p.py=p.y;
+    const a=P[j-1],tx=p.x-a.x,ty=p.y-a.y,tl=Math.hypot(tx,ty)||1,nx=-ty/tl,ny=tx/tl;
+    const f=j/N,und=Math.sin(time*0.007*w.speed+j*0.8+w.phase)*fw*0.0038*f*e;
+    const push=fw*0.0028*(1-f)*e;
+    p.x+=vx+nx*und+o.x*push;p.y+=vy+ny*und+o.y*push+G*dt*dt;
+  }
+  for(let it=0;it<10;it++){
+    P[0].x=c.x;P[0].y=c.y;
+    for(let j=0;j<N-1;j++){
+      const p=P[j],q=P[j+1];let dx=q.x-p.x,dy=q.y-p.y;const d=Math.hypot(dx,dy)||0.001,df=(d-seg)/d;
+      if(j===0){q.x-=dx*df;q.y-=dy*df}else{p.x+=dx*df*.5;p.y+=dy*df*.5;q.x-=dx*df*.5;q.y-=dy*df*.5}
+    }
+  }
+  P[0].x=c.x;P[0].y=c.y;
+}
+
+function drawWorm(w,fw){
+  const P=w.p,N=NW,wid=j=>fw*w.th*(1-0.35*j/(N-1));
+  ctx.lineCap='round';ctx.lineJoin='round';
+  const seg=(j,col,extra,alpha)=>{ctx.strokeStyle=col;ctx.lineWidth=wid(j)*extra;ctx.globalAlpha=alpha||1;ctx.beginPath();ctx.moveTo(P[j].x,P[j].y);ctx.lineTo(P[j+1].x,P[j+1].y);ctx.stroke()};
+  for(let j=0;j<N-1;j++)seg(j,'#4a1f18',1.28);
+  for(let j=0;j<N-1;j++)seg(j,w.col,1);
+  for(let j=0;j<N-1;j++)seg(j,'rgba(255,240,230,1)',0.22,0.4);
+  ctx.globalAlpha=1;
+  // body rings
+  ctx.strokeStyle='rgba(90,40,30,.5)';ctx.lineWidth=fw*0.0035;
+  for(let j=1;j<N-1;j++){
+    const dx=P[j+1].x-P[j-1].x,dy=P[j+1].y-P[j-1].y,l=Math.hypot(dx,dy)||1,nx=-dy/l,ny=dx/l,r=wid(j)*0.5;
+    ctx.beginPath();ctx.moveTo(P[j].x+nx*r,P[j].y+ny*r);ctx.lineTo(P[j].x-nx*r,P[j].y-ny*r);ctx.stroke();
+  }
+  // head dot
+  const e=P[N-1];ctx.fillStyle='rgba(60,20,15,.7)';ctx.beginPath();ctx.arc(e.x,e.y,wid(N-1)*0.22,0,6.283);ctx.fill();
+}
+
+function holesAndWorms(m,dt,time){
+  const {fw,c,ang}=m;
+  const centers=HOLES.map(h=>L[h.lm]);
+  // holes
+  HOLES.forEach((h,i)=>{
+    const p=centers[i];
+    ctx.beginPath();holePath(h,p,ang,fw,0.35);
+    ctx.fillStyle='rgba(150,95,80,.55)';ctx.fill();
+    ctx.beginPath();holePath(h,p,ang,fw,0);
+    const g=ctx.createRadialGradient(p.x,p.y,0,p.x,p.y,h.r*fw*1.2);
+    g.addColorStop(0,'#000');g.addColorStop(.6,'#120203');g.addColorStop(1,'#3a0d0d');
+    ctx.fillStyle=g;ctx.fill();
+  });
+  // worms (clipped so they emerge from inside the hole)
+  worms.forEach((w,wi)=>{
+    const h=HOLES[w.h],p=centers[w.h];
+    let ox=p.x-c.x,oy=p.y-c.y;const ol=Math.hypot(ox,oy)||1;ox/=ol;oy/=ol;
+    if(!w.p){w.p=[];for(let j=0;j<NW;j++)w.p.push({x:p.x,y:p.y,px:p.x,py:p.y})}
+    const raw=0.5+0.5*Math.sin(time*0.0009*w.speed+w.phase),t=Math.min(1,Math.max(0,(raw-0.2)/0.7)),e=t*t*(3-2*t);
+    stepWorm(w,p,{x:ox,y:oy},fw,e,dt/2,time,wi);stepWorm(w,p,{x:ox,y:oy},fw,e,dt/2,time,wi);
+    ctx.save();
+    ctx.beginPath();ctx.rect(-50,-50,W+100,H+100);holePath(h,p,ang,fw,0.0);ctx.clip('evenodd');
+    drawWorm(w,fw);
+    ctx.restore();
+  });
+  // torn flesh rims over the worm bases
+  HOLES.forEach((h,i)=>{
+    const p=centers[i];ctx.lineJoin='round';
+    ctx.beginPath();holePath(h,p,ang,fw,0.1);ctx.strokeStyle='rgba(120,55,50,.9)';ctx.lineWidth=fw*0.016;ctx.stroke();
+    ctx.beginPath();holePath(h,p,ang,fw,0.3);ctx.strokeStyle='rgba(185,125,105,.45)';ctx.lineWidth=fw*0.01;ctx.stroke();
+  });
+}
+
+function drawVideo(){
+  const vw=vid.videoWidth,vh=vid.videoHeight;if(!vw)return null;
+  const s=Math.max(W/vw,H/vh),dw=vw*s,dh=vh*s,ox=(W-dw)/2,oy=(H-dh)/2;
+  ctx.save();ctx.translate(W,0);ctx.scale(-1,1);ctx.drawImage(vid,ox,oy,dw,dh);ctx.restore();
+  return{s,dw,dh,ox,oy};
+}
+
+function loop(now){
+  const dt=Math.min(0.033,(now-t0)/1000||0.016);t0=now;
+  fit=drawVideo()||fit;
+  const ok=L&&now-lastSeen<350;
+  if(ok){
+    if(!wasOk)resetWorms();
+    const m=metrics();
+    zombieSkin(m,now);zombieEyes(m);holesAndWorms(m,dt,now);
+    hud.textContent='Open your mouth, turn and tilt your head 🧟';
+  }else if(fit)hud.textContent='Show your face to the camera';
+  wasOk=ok;
+  requestAnimationFrame(loop);
+}
+
+const BASE='https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/';
+const loadScript=src=>new Promise((res,rej)=>{const s=document.createElement('script');s.src=src;s.onload=res;s.onerror=()=>rej(new Error('script'));document.head.appendChild(s)});
+const withTimeout=(p,ms)=>Promise.race([p,new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),ms))]);
+
+async function startCam(){
+  const btn=document.getElementById('go');btn.textContent='Starting…';btn.disabled=true;
+  const msg=ui.querySelector('p');
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:960},height:{ideal:720}},audio:false});
+    vid.srcObject=stream;await vid.play();
+    ui.style.display='none';hud.textContent='Loading face tracker…';
+    if(!window.__loop){window.__loop=1;requestAnimationFrame(loop)}
+    await withTimeout(loadScript(BASE+'face_mesh.js'),8000);
+    const fm=new FaceMesh({locateFile:f=>BASE+f});
+    fm.setOptions({maxNumFaces:1,refineLandmarks:false,minDetectionConfidence:0.5,minTrackingConfidence:0.5});
+    fm.onResults(r=>{
+      const a=r.multiFaceLandmarks&&r.multiFaceLandmarks[0];
+      if(!a||!fit)return;
+      const had=L&&performance.now()-lastSeen<350;
+      if(!L||!had){L=a.map(p=>({x:W-(p.x*fit.dw+fit.ox),y:p.y*fit.dh+fit.oy}))}
+      else a.forEach((p,i)=>{const x=W-(p.x*fit.dw+fit.ox),y=p.y*fit.dh+fit.oy;L[i].x+=(x-L[i].x)*0.6;L[i].y+=(y-L[i].y)*0.6});
+      lastSeen=performance.now();
+    });
+    await withTimeout(fm.initialize(),15000);
+    tagEl.style.display='block';tagEl.textContent='Face tracking on';
+    let busy=false;
+    const pump=async()=>{
+      if(!busy&&vid.readyState>=2){busy=true;try{await fm.send({image:vid})}catch(e){}busy=false}
+      requestAnimationFrame(pump);
+    };
+    pump();
+  }catch(err){
+    ui.style.display='flex';btn.disabled=false;btn.textContent='Retry';
+    if(vid.srcObject)vid.srcObject.getTracks().forEach(t=>t.stop());
+    msg.textContent=(!navigator.mediaDevices)?'This page isn’t allowed to use the camera API here. Host it on HTTPS (e.g. GitHub Pages).':(err&&err.name==='NotAllowedError')?'Camera access was blocked. Allow the camera for this site and retry, or host the file on your own HTTPS site.':'Couldn’t start ('+((err&&err.name)||(err&&err.message)||'error')+'). The face tracker needs an internet connection and a normal HTTPS page.';
+  }
+}
+document.getElementById('go').onclick=startCam;
+</script>
+</body>
+</html>
